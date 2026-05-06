@@ -4,51 +4,61 @@
 import re
 import time
 
-TDR_WAIT = 10  # seconds to wait for test to complete
+TDR_WAIT = 10
+
 
 def ExtractInterface(text):
-    """Find interface name like Gi1/0/9, Te2/0/23, Fa0/1, etc."""
     if not text:
         return None
-    pattern = re.compile(r'\b([A-Za-z]{2,3}\d+(?:/\d+){1,2})\b')
-    m = pattern.search(text)
-    return m.group(0) if m else None
+
+    patterns = [
+        r'\b(?:Fa|Gi|Te|Twe|Fo|Hu|Eth)\d+(?:/\d+){1,3}\b',
+        r'\b(?:FastEthernet|GigabitEthernet|TenGigabitEthernet|TwentyFiveGigE|TwentyFiveGigabitEthernet|FortyGigabitEthernet|HundredGigE|Ethernet)\d+(?:/\d+){1,3}\b',
+    ]
+
+    for p in patterns:
+        m = re.search(p, text, re.IGNORECASE)
+        if m:
+            return m.group(0)
+
+    return None
 
 
 def GetSelectedInterface():
-    """Obtain interface name from selection, clipboard, or nearby text."""
     tab = crt.GetScriptTab()
     screen = tab.Screen
 
-    # 1️⃣ Highlighted text
     try:
-        sel = screen.Selection.strip()
-        iface = ExtractInterface(sel)
+        iface = ExtractInterface(screen.Selection.strip())
         if iface:
             return iface
     except:
         pass
 
-    # 2️⃣ Clipboard
     try:
-        clip = crt.Clipboard.Text.strip()
-        iface = ExtractInterface(clip)
+        iface = ExtractInterface(crt.Clipboard.Text.strip())
         if iface:
             return iface
     except:
         pass
 
-    # 3️⃣ Nearby text
     try:
         row = screen.CurrentRow
-        text = screen.Get(max(1, row - 3), 1, min(row + 3, screen.Rows), screen.Columns)
+        text = screen.Get(max(1, row - 5), 1, min(row + 5, screen.Rows), screen.Columns)
         iface = ExtractInterface(text)
         if iface:
             return iface
     except:
         pass
 
-    return None
+    iface = crt.Dialog.Prompt(
+        "No interface detected.\nEnter interface manually:",
+        "Cable Diagnostics",
+        "",
+        False
+    )
+
+    return ExtractInterface(iface)
 
 
 def Main():
@@ -57,33 +67,29 @@ def Main():
     screen.IgnoreEscape = True
 
     iface = GetSelectedInterface()
-    if not iface:
-        return  # nothing highlighted
 
-    # Detect device prompt
-    screen.Synchronous = True
-    screen.Send("\r")
-    time.sleep(0.3)
-    row = screen.CurrentRow
-    prompt = screen.Get(row, 0, row, screen.CurrentColumn - 1).strip()
-    
-    # --- Run TDR test ---
+    if not iface:
+        crt.Dialog.MessageBox("No valid interface found.", "Cable Diagnostics", 0)
+        return
+
+    confirm = crt.Dialog.MessageBox(
+        "Run TDR cable diagnostics on:\n\n" +
+        iface +
+        "\n\nThis may briefly disrupt the link on some platforms.\n\nContinue?",
+        "Confirm Cable Diagnostics",
+        4
+    )
+
+    if confirm != 6:
+        return
+
     cmd1 = "test cable-diagnostics tdr interface " + iface
     screen.Send(cmd1 + "\r")
-    # Wait for prompt with timeout
-    screen.WaitForString(prompt, 5)
 
-    screen.Synchronous = False
-
-    # --- Wait while TDR completes ---
     time.sleep(TDR_WAIT)
 
-    # --- Show results ---
     cmd2 = "show cable-diagnostics tdr interface " + iface
     screen.Send(cmd2 + "\r")
-
-    # Return control cleanly
-    screen.Synchronous = False
 
 
 Main()
