@@ -1,0 +1,9 @@
+# Optional expected STP root map.
+# If this file exists, multi-stp-snapshot.py generates stp-root-check.csv.
+#
+# Format:
+# vlan,expected_root_session
+#
+# Examples:
+# VLAN0001,CoreSwitch01
+# 10,Distribution\Building-A\Core-A
