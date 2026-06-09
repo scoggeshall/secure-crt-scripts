@@ -45,6 +45,21 @@ Path:
 
 ---
 
+### STP Snapshot
+Cisco IOS/IOS-XE spanning-tree snapshot and comparison tools.
+
+- Quick active-tab STP view
+- Multi-session STP snapshot collection from `sessions.txt`
+- Raw per-device output plus simple CSV summaries
+- Optional expected-root validation with `expected-roots.csv`
+- Local snapshot comparison with `compare-stp-snapshots.py`
+- Helper to open the latest snapshot output
+
+Path:
+`stp-snapshot/`
+
+---
+
 ## Design Principles
 
 - No hardcoded paths
