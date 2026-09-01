@@ -4,23 +4,22 @@
 import os
 import re
 
+SCRIPT_VERSION = "2.1"
 OUI_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "manuf.txt")
 
 
 def NormalizeMAC(mac_text):
+    """Return a 12-character uppercase MAC for OUI matching only."""
     clean = re.sub(r'[^0-9A-Fa-f]', '', mac_text).upper()
     return clean if len(clean) == 12 else None
 
 
-def CiscoMAC(normalized12):
-    return (
-        normalized12[0:4].lower() + "." +
-        normalized12[4:8].lower() + "." +
-        normalized12[8:12].lower()
-    )
-
-
 def ExtractMACPreserve(text):
+    """
+    Find a MAC address and return both:
+      1. The exact formatting found on the switch or supplied by the user.
+      2. A normalized 12-character value for manuf.txt lookup.
+    """
     if not text:
         return (None, None)
 
@@ -31,9 +30,9 @@ def ExtractMACPreserve(text):
     ]
 
     for pat in patterns:
-        m = pat.search(text)
-        if m:
-            preserved = m.group(0).strip()
+        match = pat.search(text)
+        if match:
+            preserved = match.group(0).strip()
             normalized = NormalizeMAC(preserved)
             if normalized:
                 return (preserved, normalized)
@@ -45,42 +44,60 @@ def GetSelectedMAC():
     try:
         tab = crt.GetScriptTab()
         screen = tab.Screen
-    except:
-        crt.Dialog.MessageBox("Unable to access SecureCRT screen.", "OUI Lookup Error", 0)
+    except Exception:
+        crt.Dialog.MessageBox(
+            "Unable to access SecureCRT screen.",
+            "OUI Lookup Error",
+            0
+        )
         return (None, None)
 
+    # Prefer explicitly selected text.
     try:
         preserved, normalized = ExtractMACPreserve(screen.Selection.strip())
         if preserved:
             return (preserved, normalized)
-    except:
+    except Exception:
         pass
 
+    # Then try clipboard contents.
     try:
         preserved, normalized = ExtractMACPreserve(crt.Clipboard.Text.strip())
         if preserved:
             return (preserved, normalized)
-    except:
+    except Exception:
         pass
 
+    # Then search near the cursor.
     try:
         row = screen.CurrentRow
-        text = screen.Get(max(1, row - 5), 1, min(row + 5, screen.Rows), screen.Columns)
+        text = screen.Get(
+            max(1, row - 5),
+            1,
+            min(row + 5, screen.Rows),
+            screen.Columns
+        )
         preserved, normalized = ExtractMACPreserve(text)
         if preserved:
             return (preserved, normalized)
-    except:
+    except Exception:
         pass
 
+    # Last automatic attempt: search the visible terminal screen.
     try:
         text = screen.Get(1, 1, screen.Rows, screen.Columns)
         preserved, normalized = ExtractMACPreserve(text)
         if preserved:
             return (preserved, normalized)
-    except:
+    except Exception:
         pass
 
-    mac_input = crt.Dialog.Prompt("No MAC detected.\nEnter manually:", "OUI Lookup", "", False)
+    mac_input = crt.Dialog.Prompt(
+        "No MAC detected.\nEnter manually:",
+        "OUI Lookup",
+        "",
+        False
+    )
     return ExtractMACPreserve(mac_input)
 
 
@@ -91,7 +108,7 @@ def ParseManufPrefix(raw_prefix):
         base, bits = raw_prefix.split("/", 1)
         try:
             bits = int(bits)
-        except:
+        except Exception:
             return (None, None)
     else:
         base = raw_prefix
@@ -115,6 +132,7 @@ def ParseManufPrefix(raw_prefix):
 
 
 def LookupVendor(normalized12):
+    """Use only the normalized MAC value when searching manuf.txt."""
     if not normalized12:
         return "Invalid MAC address."
 
@@ -126,9 +144,8 @@ def LookupVendor(normalized12):
     best_prefix = None
 
     try:
-        f = open(OUI_FILE, "rb")
-        data = f.read().decode("utf-8", "ignore")
-        f.close()
+        with open(OUI_FILE, "rb") as oui_handle:
+            data = oui_handle.read().decode("utf-8", "ignore")
 
         for line in data.splitlines():
             if not line or line.startswith("#"):
@@ -150,60 +167,74 @@ def LookupVendor(normalized12):
                     best_vendor = parts[2].strip()
                 else:
                     best_vendor = parts[1].strip()
-
+        
         if best_vendor:
             return (
-                "Vendor: " + best_vendor + "\n" +
+                "Vendor:\n" +
+                best_vendor + "\n" +
                 "OUI Match: " + best_prefix + "/" + str(best_bits)
             )
 
         return "Vendor not found.\nOUI Prefix: " + normalized12[:6]
 
-    except Exception as e:
-        return "Error reading OUI file:\n" + str(e)
+    except Exception as error:
+        return "Error reading OUI file:\n" + str(error)
 
 
 def Main():
     try:
         tab = crt.GetScriptTab()
         screen = tab.Screen
-    except:
+    except Exception:
         return
 
-    mac_preserved, mac_norm = GetSelectedMAC()
+    mac_preserved, mac_normalized = GetSelectedMAC()
 
-    if not mac_preserved or not mac_norm:
+    if not mac_preserved or not mac_normalized:
         crt.Dialog.MessageBox(
             "No MAC address found.\nHighlight or copy one first.",
-            "OUI Lookup",
+            "OUI Lookup v" + SCRIPT_VERSION,
             0
         )
         return
 
-    vendor = LookupVendor(mac_norm)
-    mac_cisco = CiscoMAC(mac_norm)
-
-    command = "show ip arp | inc " + mac_cisco
+    vendor = LookupVendor(mac_normalized)
+    # Critical behavior:
+    # Use the exact MAC format detected from the switch for the ARP command.
+    command = "show ip arp | inc " + mac_preserved
 
     msg = (
-    "MAC Address\n"
-    "-----------\n"
-    + mac_cisco + "\n\n"
-    "Vendor Match\n"
-    "------------\n"
-    + vendor + "\n\n"
-    "Command\n"
-    
-    + command + "\n\n"
-    "Send this command to the active session?"
-)
+        "MAC Address From Switch\n"
+        "------------------------------\n" +
+        mac_preserved + "\n\n\n"
+        "Vendor Match\n"
+        "------------------------------\n" +
+        vendor + "\n\n\n"
+        "Command\n"
+        "------------------------------\n" +
+        command + "\n\n\n"
+        "Choose an action:\n"
+        "Yes = Send to active session\n"
+        "No = Copy to clipboard\n"
+        "Cancel = Do nothing"
+    )
 
-    resp = crt.Dialog.MessageBox(msg, "OUI Lookup", 4)
+    # MB_YESNOCANCEL = 3
+    response = crt.Dialog.MessageBox(msg, "OUI Lookup v" + SCRIPT_VERSION, 3)
 
-    if resp == 6:
+    # IDYES = 6
+    if response == 6:
         screen.Send(command + "\r")
 
-        
+    # IDNO = 7
+    elif response == 7:
+        crt.Clipboard.Format = "CF_TEXT"
+        crt.Clipboard.Text = command
+        crt.Dialog.MessageBox(
+            "Command copied to clipboard:\n\n" + command,
+            "OUI Lookup v" + SCRIPT_VERSION,
+            0
+        )
 
 
 Main()

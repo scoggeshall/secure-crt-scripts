@@ -1,6 +1,0 @@
-# One SecureCRT session name per line.
-# Use names as they appear in the Connect dialog, excluding the leading Sessions\ folder.
-#
-# Examples:
-# CoreSwitch01
-# Access\IDF-1\Switch01
