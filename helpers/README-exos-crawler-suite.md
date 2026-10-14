@@ -57,7 +57,10 @@ A command is recorded when it is enqueued, not only when processed, so alternate
 Output containing `%%` / `%` lines or "invalid input", "ambiguous command", "incomplete command" or "unknown command" is logged as `ERROR RESPONSE`, counted, not parsed, and not expanded.
 
 ### Read-only command timeouts
-If `show management`, `show version`, `show switch` or a paging command does not finish (screen never idle), the script sends Ctrl+C and confirms a CLI prompt is visible before sending anything else. If no prompt is recovered it raises an error: metadata collection stops, and paging commands report failure rather than being sent blindly.
+If `show management`, `show version`, `show switch` or a paging command does not finish (screen never idle), the script sends Ctrl+C and confirms a CLI prompt is visible before sending anything else. Prompt confirmation looks only at the cursor row (a prompt left visible on an earlier row, for example above a pager, does not count). If no prompt is confirmed it raises an error: metadata collection stops and the crawl is skipped, and paging commands report failure rather than being sent blindly. Help queries make the same check before each `?` is sent and after a timeout; if it fails mid-crawl the crawl stops and no further queries are sent (paging restore is still attempted, and will normally be reported as failed).
+
+### Final status
+The output summary (`Status:`) and final dialog say one of: `Crawl complete`; `Crawl SKIPPED (no help queries were sent)` with the reason (paging declined or could not be disabled, or prompt lost during metadata); or `Crawl STOPPED EARLY` (prompt lost mid-crawl).
 
 ### CLI paging
 Before changing anything the scripts run `show management` and look for a `CLI paging : Enabled|Disabled` line.
