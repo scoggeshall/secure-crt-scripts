@@ -8,7 +8,7 @@ import os
 import re
 
 SCRIPT_TITLE = "EXOS Configuration Context Crawler"
-OUTPUT_ROOT = r"C:\scripts\secure-crt\outputs\exos-context-help"
+OUTPUT_LEAF = 'exos-context-help'
 CONTEXT_ROOTS = ["configure", "enable", "disable", "create", "delete", "unconfigure"]
 
 # EXOS has a flat CLI. This is the equivalent of the VOSS config-mode crawler:
@@ -121,13 +121,14 @@ def Main():
     if answer is None or answer.strip().upper() != "CONTEXTCRAWL":
         return
 
-    ensure_directory(OUTPUT_ROOT)
+    output_root = resolve_output_root(OUTPUT_LEAF)
+    ensure_directory(output_root)
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_path = os.path.join(OUTPUT_ROOT, timestamp + "_" + sanitize_filename(hostname_from_prompt(prompt)) + "_context-help.txt")
+    output_path = os.path.join(output_root, timestamp + "_" + sanitize_filename(hostname_from_prompt(prompt)) + "_context-help.txt")
     previous_logging = session.Logging
     previous_log_file = session.LogFileName
     stats = new_stats()
-    restore_command = None
+    paging = new_paging_state()
 
     try:
         if session.Logging:
@@ -148,14 +149,14 @@ def Main():
             lines.append("  " + key + ": " + BASELINE_VALUES[key] + "\n")
         lines.append("\n")
         write_text(output_path, "".join(lines))
-        stats["metadata_failures"] = collect_platform_metadata(screen, session, output_path)
-
-        proceed, restore_command, paging_note = prepare_paging(screen, session, output_path)
-        append_text(output_path, "CLI paging: " + paging_note + "\n\n")
+        proceed = prepare_paging(screen, session, output_path, paging, stats)
+        append_text(output_path, "CLI paging: " + paging["note"] + "\n\n")
         if proceed:
+            stats["metadata_failures"] = collect_platform_metadata(screen, session, output_path)
             run_context_crawl(screen, session, output_path, stats)
         else:
-            append_text(output_path, "Crawl canceled by user before paging was changed.\n")
+            append_text(output_path, "Crawl not run (see CLI paging note above).\n")
+        restore_paging(screen, session, output_path, paging, stats)
 
         append_text(output_path,
             "\n" + "#" * 110 + "\nFinal Crawl Summary\n" + "#" * 110 + "\n"
@@ -169,7 +170,9 @@ def Main():
             "Duplicate commands not re-queued: " + str(stats["duplicates"]) + "\n"
             "Token-limit branches skipped: " + str(stats["token_skips"]) + "\n"
             "Metadata query failures: " + str(stats["metadata_failures"]) + "\n"
-            "Failures: " + str(stats["failures"]) + "\n")
+            "Failures: " + str(stats["failures"]) + "\n"
+        "Paging failures: " + str(len(stats["paging_failures"])) + "\n"
+        + "".join(["  " + m + "\n" for m in stats["paging_failures"]]))
     finally:
         try:
             if session.Logging:
@@ -177,7 +180,7 @@ def Main():
         except Exception:
             pass
         try:
-            restore_paging(screen, restore_command)
+            restore_paging(screen, session, output_path, paging, stats)
         except Exception:
             pass
         try:
@@ -198,14 +201,21 @@ def Main():
         + "\nIncomplete queries (timeouts): " + str(stats["incomplete"])
         + "\nError responses: " + str(stats["errors"])
         + "\nFailures: " + str(stats["failures"])
+        + paging_failure_text(stats)
         + "\n\nOutput file:\n" + output_path,
         SCRIPT_TITLE)
+
+
+def paging_failure_text(stats):
+    if not stats["paging_failures"]:
+        return ""
+    return "\n\nPAGING PROBLEMS (check CLI paging manually):\n" + "\n".join(stats["paging_failures"])
 
 
 def new_stats():
     return {"queries": 0, "literals": 0, "placeholders": 0, "resolved": 0,
             "unresolved": 0, "failures": 0, "token_skips": 0, "incomplete": 0,
-            "errors": 0, "duplicates": 0, "metadata_failures": 0}
+            "errors": 0, "duplicates": 0, "metadata_failures": 0, "paging_failures": []}
 
 
 def run_context_crawl(screen, session, output_path, stats):
@@ -334,9 +344,22 @@ def capture_help_query(screen, session, command, output_path):
     return normalize_capture(read_file_from_offset(output_path, start)), complete
 
 
-def capture_readonly_command(screen, session, command, output_path):
-    """Run one read-only show command. Returns (text, complete)."""
+class PromptLostError(Exception):
+    pass
+
+
+def ensure_usable_prompt(screen):
+    """Cancel any partial input and confirm a CLI prompt is visible and idle."""
     clear_command_line(screen)
+    return get_prompt(screen) != ""
+
+
+def capture_readonly_command(screen, session, command, output_path):
+    """Run one read-only command. Returns (text, complete).
+    On a timeout the command is canceled with Ctrl+C and the prompt is
+    confirmed; PromptLostError is raised if the CLI is not usable again."""
+    if not ensure_usable_prompt(screen):
+        raise PromptLostError("No usable CLI prompt before: " + command)
     start = get_file_size(output_path)
     start_capture(session, output_path)
     complete = True
@@ -345,10 +368,27 @@ def capture_readonly_command(screen, session, command, output_path):
         crt.Sleep(NORMAL_COMMAND_DELAY_MS)
         if not wait_for_screen_idle(screen):
             complete = False
+            screen.Send(chr(3))
+            crt.Sleep(AFTER_CANCEL_DELAY_MS)
+            wait_for_screen_idle(screen)
     finally:
         session.Log(False)
     crt.Sleep(BETWEEN_QUERY_DELAY_MS)
-    return normalize_capture(read_file_from_offset(output_path, start)), complete
+    text = normalize_capture(read_file_from_offset(output_path, start))
+    if not complete and not ensure_usable_prompt(screen):
+        raise PromptLostError("CLI prompt not recovered after timeout: " + command)
+    return text, complete
+
+
+def resolve_output_root(leaf):
+    """Output directory: $EXOS_CRAWLER_OUTPUT_ROOT/<leaf> if set, otherwise
+    <home>/Documents/SecureCRT-Outputs/<leaf>."""
+    override = os.environ.get("EXOS_CRAWLER_OUTPUT_ROOT", "").strip()
+    if override:
+        base = override
+    else:
+        base = os.path.join(os.path.expanduser("~"), "Documents", "SecureCRT-Outputs")
+    return os.path.join(base, leaf)
 
 
 def classify_help_response(text):
@@ -429,17 +469,38 @@ def parse_paging_state(text):
     return None
 
 
-def prepare_paging(screen, session, output_path):
-    """Detect the current CLI paging state, then disable paging if needed.
-    Returns (proceed, restore_command, note). restore_command is None when the
-    original state needs no restoration."""
-    text, complete = capture_readonly_command(screen, session, "show management", output_path)
-    state = parse_paging_state(text) if complete else None
+def new_paging_state():
+    return {"restore_command": None, "restored": False, "note": ""}
+
+
+def set_paging(screen, session, output_path, command):
+    """Run a paging command. Returns (ok, detail); never raises for CLI problems."""
+    try:
+        text, complete = capture_readonly_command(screen, session, command, output_path)
+    except Exception as exc:
+        return False, to_text(exc)
+    if not complete:
+        return False, "timed out"
+    if classify_help_response(text) == "error":
+        return False, "device returned an error"
+    return True, "ok"
+
+
+def prepare_paging(screen, session, output_path, paging, stats):
+    """Detect the CLI paging state and disable paging if needed.
+    Returns True if the crawl may proceed. paging["restore_command"] is set
+    BEFORE the disable attempt so cleanup always knows paging may have changed."""
+    try:
+        text, complete = capture_readonly_command(screen, session, "show management", output_path)
+        state = parse_paging_state(text) if complete else None
+    except Exception as exc:
+        state = None
+        stats["paging_failures"].append("Paging state query failed: " + to_text(exc))
     if state is False:
-        return True, None, "already disabled; left unchanged"
+        paging["note"] = "already disabled; left unchanged"
+        return True
     if state is True:
-        restore = "enable cli paging"
-        note = "was enabled; disabled for the crawl and will be re-enabled"
+        paging["note"] = "was enabled; disabled for the crawl and will be re-enabled"
     else:
         answer = crt.Dialog.MessageBox(
             "The script could not read the current CLI paging state from 'show management'.\n\n"
@@ -448,16 +509,34 @@ def prepare_paging(screen, session, output_path):
             "Continue?",
             SCRIPT_TITLE, 32 | 4)
         if answer != IDYES:
-            return False, None, "state unknown; user declined; paging not changed"
-        restore = "enable cli paging"
-        note = "state could not be detected; user confirmed; will be set to enabled afterward"
-    run_normal_command(screen, "disable cli paging")
-    return True, restore, note
+            paging["note"] = "state unknown; user declined; paging not changed"
+            return False
+        paging["note"] = "state could not be detected; user confirmed; will be set to enabled afterward"
+    paging["restore_command"] = "enable cli paging"
+    ok, detail = set_paging(screen, session, output_path, "disable cli paging")
+    if not ok:
+        stats["paging_failures"].append("Disable paging failed: " + detail)
+        paging["note"] += "; DISABLE FAILED (" + detail + "); crawl skipped"
+        return False
+    return True
 
 
-def restore_paging(screen, restore_command):
-    if restore_command:
-        run_normal_command(screen, restore_command)
+def restore_paging(screen, session, output_path, paging, stats):
+    """Restore paging once. Failures are counted and written to the output file."""
+    if paging["restored"] or not paging["restore_command"]:
+        return True
+    paging["restored"] = True
+    ok, detail = set_paging(screen, session, output_path, paging["restore_command"])
+    if ok:
+        append_text(output_path, "\nCLI paging restore: '" + paging["restore_command"] + "' succeeded.\n")
+        return True
+    message = "Restore paging failed ('" + paging["restore_command"] + "'): " + detail
+    stats["paging_failures"].append(message)
+    try:
+        append_text(output_path, "\nCLI paging restore: FAILED. " + message + "\nCheck and restore the CLI paging setting manually.\n")
+    except Exception:
+        pass
+    return False
 
 
 def parse_platform_metadata(version_text, switch_text):
@@ -498,7 +577,12 @@ def collect_platform_metadata(screen, session, output_path):
                     session.Log(False)
             except Exception:
                 pass
-    items = parse_platform_metadata(texts[0] if texts else u"", texts[1] if len(texts) > 1 else u"")
+            if isinstance(exc, PromptLostError):
+                lines.append("  Remaining metadata queries skipped: CLI prompt not usable.\n")
+                break
+    while len(texts) < 2:
+        texts.append(u"")
+    items = parse_platform_metadata(texts[0], texts[1])
     if not items:
         failures += 1
         lines.append("  No EXOS version or platform information could be parsed.\n")

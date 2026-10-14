@@ -6,18 +6,20 @@ Three self-contained SecureCRT Python scripts record the Extreme EXOS / Switch E
 
 | Script | Starting root(s) | Confirmation word | Output directory |
 |---|---|---|---|
-| `exos-show-help-crawler.py` | `show` | `SHOWCRAWL` | `C:\scripts\secure-crt\outputs\exos-show-help\` |
-| `exos-config-help-crawler.py` | `configure` | `CONFIGCRAWL` | `C:\scripts\secure-crt\outputs\exos-config-help\` |
-| `exos-config-mode-crawler.py` (context crawler) | `configure`, `enable`, `disable`, `create`, `delete`, `unconfigure` | `CONTEXTCRAWL` | `C:\scripts\secure-crt\outputs\exos-context-help\` |
+| `exos-show-help-crawler.py` | `show` | `SHOWCRAWL` | `<output base>/exos-show-help/` |
+| `exos-config-help-crawler.py` | `configure` | `CONFIGCRAWL` | `<output base>/exos-config-help/` |
+| `exos-config-mode-crawler.py` (context crawler) | `configure`, `enable`, `disable`, `create`, `delete`, `unconfigure` | `CONTEXTCRAWL` | `<output base>/exos-context-help/` |
 
 Output file name: `YYYYMMDD-HHMMSS_<HOSTNAME>_<suffix>.txt`, where the suffix is `show-help`, `config-help` or `context-help`.
 
-The output directory is a constant (`OUTPUT_ROOT`) at the top of each script. The repository principle of "no hardcoded paths" is not met by these crawlers: edit `OUTPUT_ROOT` if `C:\scripts\secure-crt\outputs\` does not suit your machine. Each script is self-contained (the shared helper block is duplicated in all three); this guide covers all three rather than one README per script.
+### Output location
+
+`<output base>` defaults to `Documents\SecureCRT-Outputs` under the current user's home directory (`os.path.expanduser("~")`); no drive letter or username is embedded. The single override is the environment variable `EXOS_CRAWLER_OUTPUT_ROOT`, which replaces the base directory (the per-crawler subfolder is still appended). It must be set before SecureCRT starts. The directory is created if missing; if it is not writable the script fails when creating the file. Each script is self-contained (the shared helper block is duplicated in all three), and this one suite guide documents all three; there is no per-script README.
 
 ## Safety model
 
 - Only question-mark help is sent (`<command> ?`, no Enter) and then canceled with Ctrl+C. Discovered commands are never executed.
-- Commands that ARE executed (Enter pressed), all read-only except paging:
+- Commands that ARE executed (Enter pressed), all read-only except the paging setting:
   - `show management` (read the CLI paging state)
   - `show version`, `show switch` (platform metadata)
   - `disable cli paging` and later `enable cli paging` (see below)
@@ -27,9 +29,10 @@ The output directory is a constant (`OUTPUT_ROOT`) at the top of each script. Th
 ## Run flow
 
 1. Prompt detection, then a confirmation dialog; type the confirmation word.
-2. The output file is created with a header (prompt, roots, limits) and platform metadata.
-3. CLI paging is handled (below), then the crawl runs.
-4. A final summary is appended and a message box shows the counts.
+2. The output file is created with a header (prompt, roots, limits).
+3. CLI paging is handled first (below). If paging could not be disabled, the crawl is skipped.
+4. Platform metadata (`show version`, `show switch`) is collected, then the crawl runs.
+5. Paging is restored, a final summary is appended, and a message box shows the counts.
 
 ## Limits
 
@@ -53,17 +56,23 @@ A command is recorded when it is enqueued, not only when processed, so alternate
 ### Error responses
 Output containing `%%` / `%` lines or "invalid input", "ambiguous command", "incomplete command" or "unknown command" is logged as `ERROR RESPONSE`, counted, not parsed, and not expanded.
 
+### Read-only command timeouts
+If `show management`, `show version`, `show switch` or a paging command does not finish (screen never idle), the script sends Ctrl+C and confirms a CLI prompt is visible before sending anything else. If no prompt is recovered it raises an error: metadata collection stops, and paging commands report failure rather than being sent blindly.
+
 ### CLI paging
 Before changing anything the scripts run `show management` and look for a `CLI paging : Enabled|Disabled` line.
 
-- Enabled: paging is disabled for the crawl and `enable cli paging` is sent on completion, cancellation or error (`finally` block).
+- Enabled: the restore action (`enable cli paging`) is recorded first, then `disable cli paging` is sent. The restore is attempted on completion, cancellation, error, and after a failed or timed-out disable (in case paging did change).
 - Disabled: paging is left untouched and nothing is restored.
 - State not readable: a Yes/No dialog explains the limitation (paging will be disabled and then set to *enabled*, the EXOS default, even if it was disabled before). Answering No stops before paging is changed.
+- A failed disable skips the crawl. A failed restore does not raise; both are recorded in the output file (`CLI paging restore: FAILED`, "Paging failures" in the summary) and in the final dialog under "PAGING PROBLEMS". Check the setting manually when that appears. If the script itself raises, the failure is only guaranteed to be in the output file, since the final dialog is not reached.
 
-The `show management` field label is an assumption (see Unverified items). Detection failure falls back to the confirmation dialog.
+Success means the command completed without a timeout or an error response; the resulting state is not re-read from the device.
+
+The `show management` field label is an assumption (see Unverified items).
 
 ### Platform metadata
-`show version` and `show switch` output is captured and the EXOS/Switch Engine version, system type, boot ROM and hardware lines are parsed into the header. A failed, incomplete or unparsable metadata query is recorded in the file and counted ("Metadata query failures") but does not stop the crawl. The raw captured text also remains in the output file.
+`show version` and `show switch` output is captured (after paging is handled) and the EXOS/Switch Engine version, system type, boot ROM and hardware lines are parsed into the output. A failed, incomplete or unparsable metadata query is recorded and counted ("Metadata query failures") but does not stop the crawl. The raw captured text also remains in the output file.
 
 ### Parsing
 Help lines of the form `token  description` are classified:
@@ -95,11 +104,11 @@ Because the device parser validates context-sensitive values in help (e.g. nonex
 
     python3 -m unittest discover -s helpers/tests -v
 
-Tests cover parser classification, timeout handling, duplicate queue prevention, paging-state restoration (success, error, cancellation, unknown state), and metadata parsing, using fake SecureCRT objects. The scripts avoid Python 3-only syntax, but only Python 3.12 was used to compile and test them; verify against the Python version in your SecureCRT.
+The tests use SYNTHETIC fixtures and fake SecureCRT/CLI objects. They are not captures from a live EXOS device and do not validate real EXOS output or the SecureCRT runtime. They cover parser classification, timeout handling (including read-only command cancellation and prompt confirmation), duplicate queue prevention, the paging lifecycle (command order, disable failure, restore failure, error/cancellation cleanup, and visibility of failures in the output and final dialog), output-path resolution, and metadata parsing. The scripts avoid Python 3-only syntax, but only Python 3.12 was used to compile and test them.
 
 ## Feature coverage checklist
 
-The VLAN, LLDP, STP, LAG/MLAG, loop-protection, routing and multicast guides were not available in this repository, so this checklist lists the feature areas a crawl should be reviewed for. Treat the live device parser as authoritative for version-specific syntax; tick items only after reviewing a real crawl.
+The VLAN, LLDP, STP, LAG/MLAG, loop-protection, routing and multicast guides were not available in the workspace, so this checklist is NOT derived from them. It lists the feature areas a crawl should be reviewed for. Treat the live device parser as authoritative for version-specific syntax; tick items only after reviewing a real crawl.
 
 - [ ] VLANs (`configure vlan`, `create vlan`, tagging, `show vlan`)
 - [ ] LLDP (`configure lldp`, `enable/disable lldp`, `show lldp`)
@@ -117,4 +126,6 @@ The VLAN, LLDP, STP, LAG/MLAG, loop-protection, routing and multicast guides wer
 - Whether uppercase/camel-case tokens are ever legitimate literals.
 - Error-message wording used for error classification.
 - Behavior of the context crawler's example values against real device validation.
-- Python version embedded in the target SecureCRT.
+- The target SecureCRT's embedded Python runtime (scripts have only been compiled/tested on Python 3.12 with fakes), plus SecureCRT's behavior for `Screen.WaitForCursor`, session logging and dialogs.
+- Whether `Documents\\SecureCRT-Outputs` is writable in your environment.
+- Paging restore is not re-verified against the device after it is sent.

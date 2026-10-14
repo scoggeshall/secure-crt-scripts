@@ -1,8 +1,9 @@
 # Fixture-based tests for the EXOS crawlers. Run from the repository root:
 #   python3 -m unittest discover -s helpers/tests -v
 #
-# The fixtures are SYNTHETIC approximations of EXOS "?" output; they are not
-# captures from a live device. See helpers/README-exos-crawler-suite.md.
+# ALL fixtures and the fake SecureCRT/CLI objects here are SYNTHETIC. They are
+# not captures from a live EXOS device and do not validate real EXOS output or
+# the SecureCRT runtime. See helpers/README-exos-crawler-suite.md.
 import collections
 import os
 import shutil
@@ -113,6 +114,7 @@ class AllScripts(object):
         self.ns = load(self.script, self.crt)
 
     def tearDown(self):
+        os.environ.pop("EXOS_CRAWLER_OUTPUT_ROOT", None)
         shutil.rmtree(self.tmp)
 
     def read(self):
@@ -209,19 +211,30 @@ class AllScripts(object):
         self.assertEqual(items["EXOS version"], "ExtremeXOS 31.7.1.4")
         self.assertEqual(items["System type"], "X460G2-24p-10G4")
 
-    def run_main(self, mgmt_text, crawl_exc=None, answer_yes=True):
+    # ---- paging lifecycle (scripted fake CLI; synthetic, not EXOS output) ----
+    def run_main(self, mgmt_text, responses=None, crawl_exc=None, answer_yes=True):
+        """Run Main() with capture_readonly_command and the crawl replaced by
+        recorders. responses maps a command to "timeout" or an Exception to raise."""
         ns = self.ns
-        ns["OUTPUT_ROOT"] = self.tmp
-        self.dialog.answer = [v for k, v in ns.items() if k == "CONFIRMATION"][0] if "CONFIRMATION" in ns else "CONTEXTCRAWL"
+        responses = responses or {}
+        self.order = []
+        self.dialog.answer = ns.get("CONFIRMATION", "CONTEXTCRAWL")
         self.dialog.message_box = 6 if answer_yes else 7
-        calls = {"n": 0}
+        os.environ["EXOS_CRAWLER_OUTPUT_ROOT"] = self.tmp
 
         def readonly(screen, session, command, path):
-            self.screen.sent.append("RO:" + command)
-            return (mgmt_text if command == "show management" else SHOW_VERSION + SHOW_SWITCH), True
+            self.order.append(command)
+            outcome = responses.get(command)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if outcome == "timeout":
+                return u"", False
+            if command == "show management":
+                return mgmt_text, True
+            return SHOW_VERSION + SHOW_SWITCH, True
 
         def crawl(*a):
-            self.screen.sent.append("CRAWL")
+            self.order.append("CRAWL")
             if crawl_exc:
                 raise crawl_exc
 
@@ -233,42 +246,167 @@ class AllScripts(object):
             return exc
         return None
 
-    def cmds(self):
-        return [s.strip() for s in self.screen.sent if "paging" in s]
+    def output_text(self):
+        found = []
+        for root, dirs, files in os.walk(self.tmp):
+            found += [os.path.join(root, f) for f in files if f.endswith(".txt") and f != "out.txt"]
+        self.assertEqual(len(found), 1)
+        with open(found[0], "rb") as handle:
+            return handle.read().decode("utf-8")
 
-    def test_paging_enabled_restored_on_success(self):
-        self.run_main(SHOW_MGMT_ENABLED)
-        self.assertEqual(self.cmds(), ["disable cli paging", "enable cli paging"])
+    def final_dialog(self):
+        return self.dialog.boxes[-1]
 
-    def test_paging_restored_on_error(self):
-        self.run_main(SHOW_MGMT_ENABLED, crawl_exc=RuntimeError("boom"))
-        self.assertEqual(self.cmds(), ["disable cli paging", "enable cli paging"])
+    FULL_ORDER = ["show management", "disable cli paging", "show version",
+                  "show switch", "CRAWL", "enable cli paging"]
 
-    def test_paging_restored_on_cancellation(self):
+    def test_command_order_paging_before_metadata(self):
+        self.assertIsNone(self.run_main(SHOW_MGMT_ENABLED))
+        self.assertEqual(self.order, self.FULL_ORDER)
+        self.assertIn("Platform metadata", self.output_text())
+        self.assertNotIn("PAGING PROBLEMS", self.final_dialog())
+
+    def test_restored_on_crawl_error(self):
+        exc = self.run_main(SHOW_MGMT_ENABLED, crawl_exc=RuntimeError("boom"))
+        self.assertIsInstance(exc, RuntimeError)
+        self.assertEqual(self.order[-1], "enable cli paging")
+        self.assertEqual(self.order.count("enable cli paging"), 1)
+
+    def test_restored_on_cancellation(self):
         exc = self.run_main(SHOW_MGMT_ENABLED, crawl_exc=KeyboardInterrupt())
         self.assertIsInstance(exc, KeyboardInterrupt)
-        self.assertEqual(self.cmds(), ["disable cli paging", "enable cli paging"])
+        self.assertEqual(self.order[-1], "enable cli paging")
+        self.assertEqual(self.order.count("enable cli paging"), 1)
 
-    def test_paging_already_disabled_left_alone(self):
+    def test_already_disabled_left_alone(self):
         self.run_main(SHOW_MGMT_DISABLED)
-        self.assertEqual(self.cmds(), [])
-        self.assertIn("CRAWL", self.screen.sent)
+        self.assertEqual(self.order, ["show management", "show version", "show switch", "CRAWL"])
 
-    def test_unknown_state_requires_confirmation(self):
+    def test_unknown_state_declined_changes_nothing(self):
         self.run_main(u"garbage", answer_yes=False)
-        self.assertEqual(self.cmds(), [])
-        self.assertNotIn("CRAWL", self.screen.sent)
+        self.assertEqual(self.order, ["show management"])
+        self.assertIn("could not read the current CLI paging state", self.dialog.boxes[0])
 
     def test_unknown_state_confirmed(self):
         self.run_main(u"garbage", answer_yes=True)
-        self.assertEqual(self.cmds(), ["disable cli paging", "enable cli paging"])
+        self.assertEqual(self.order, self.FULL_ORDER)
+        self.assertIn("could not read the current CLI paging state", self.dialog.boxes[0])
 
-    def test_metadata_in_header_and_failure_does_not_block(self):
-        self.run_main(SHOW_MGMT_ENABLED)
-        out = [f for f in os.listdir(self.tmp) if f.endswith(".txt")][0]
-        with open(os.path.join(self.tmp, out), "rb") as handle:
-            text = handle.read().decode("utf-8")
-        self.assertIn("Platform metadata", text)
+    def test_disable_timeout_skips_crawl_but_still_restores(self):
+        self.run_main(SHOW_MGMT_ENABLED, responses={"disable cli paging": "timeout"})
+        self.assertNotIn("CRAWL", self.order)
+        self.assertNotIn("show version", self.order)
+        self.assertEqual(self.order[-1], "enable cli paging")
+        self.assertIn("Disable paging failed", self.output_text())
+        self.assertIn("PAGING PROBLEMS", self.final_dialog())
+        self.assertIn("Disable paging failed", self.final_dialog())
+
+    def test_disable_exception_still_attempts_restore(self):
+        self.run_main(SHOW_MGMT_ENABLED, responses={"disable cli paging": self.ns["PromptLostError"]("lost")})
+        self.assertNotIn("CRAWL", self.order)
+        self.assertEqual(self.order[-1], "enable cli paging")
+        self.assertIn("Disable paging failed", self.final_dialog())
+
+    def test_restore_failure_visible_in_file_summary_and_dialog(self):
+        self.run_main(SHOW_MGMT_ENABLED, responses={"enable cli paging": "timeout"})
+        text = self.output_text()
+        self.assertIn("CLI paging restore: FAILED", text)
+        self.assertIn("Paging failures: 1", text)
+        self.assertIn("Restore paging failed", self.final_dialog())
+
+    def test_restore_exception_visible(self):
+        self.run_main(SHOW_MGMT_ENABLED, responses={"enable cli paging": RuntimeError("x")})
+        self.assertIn("Restore paging failed", self.final_dialog())
+        self.assertIn("Restore paging failed", self.output_text())
+
+    def test_restore_failure_after_crawl_error_recorded_in_file(self):
+        self.run_main(SHOW_MGMT_ENABLED, responses={"enable cli paging": "timeout"}, crawl_exc=RuntimeError("boom"))
+        self.assertIn("CLI paging restore: FAILED", self.output_text())
+
+    def test_set_paging_reports_status(self):
+        ns = self.ns
+        ns["capture_readonly_command"] = lambda *a: (u"", True)
+        self.assertEqual(ns["set_paging"](None, None, self.out, "disable cli paging"), (True, "ok"))
+        ns["capture_readonly_command"] = lambda *a: (u"", False)
+        self.assertFalse(ns["set_paging"](None, None, self.out, "disable cli paging")[0])
+        ns["capture_readonly_command"] = lambda *a: (ERROR_FIXTURE, True)
+        self.assertFalse(ns["set_paging"](None, None, self.out, "disable cli paging")[0])
+
+    def test_restore_command_set_before_disable_attempt(self):
+        ns = self.ns
+        paging = ns["new_paging_state"]()
+        stats = ns["new_stats"]()
+        seen = {}
+
+        def readonly(screen, session, command, path):
+            if command == "show management":
+                return SHOW_MGMT_ENABLED, True
+            seen["restore"] = paging["restore_command"]
+            raise RuntimeError("disable blew up")
+
+        ns["capture_readonly_command"] = readonly
+        self.assertFalse(ns["prepare_paging"](self.screen, self.crt.session, self.out, paging, stats))
+        self.assertEqual(seen["restore"], "enable cli paging")
+        self.assertEqual(len(stats["paging_failures"]), 1)
+
+    # ---- read-only command timeout ----
+    def test_readonly_timeout_cancels_and_confirms_prompt(self):
+        self.screen.idle = False
+        self.ns["MAX_IDLE_CHECKS"] = 1
+        open(self.out, "wb").close()
+        text, complete = self.ns["capture_readonly_command"](self.screen, self.crt.session, "show version", self.out)
+        self.assertFalse(complete)
+        sent = self.screen.sent
+        self.assertLess(sent.index("show version\r"), len(sent) - 1 - sent[::-1].index(chr(3)))
+
+    def test_readonly_timeout_prompt_not_recovered_raises(self):
+        self.screen.idle = False
+        self.ns["MAX_IDLE_CHECKS"] = 1
+        open(self.out, "wb").close()
+        calls = {"n": 0}
+        original = self.screen.Get
+
+        def get(*a):
+            calls["n"] += 1
+            return original(*a) if calls["n"] <= 1 else ""
+        self.screen.Get = get
+        with self.assertRaises(self.ns["PromptLostError"]):
+            self.ns["capture_readonly_command"](self.screen, self.crt.session, "show version", self.out)
+
+    def test_no_prompt_blocks_next_command(self):
+        self.screen.Get = lambda *a: ""
+        open(self.out, "wb").close()
+        with self.assertRaises(self.ns["PromptLostError"]):
+            self.ns["capture_readonly_command"](self.screen, self.crt.session, "show version", self.out)
+        self.assertNotIn("show version\r", self.screen.sent)
+
+    def test_metadata_stops_after_prompt_lost(self):
+        ns = self.ns
+        calls = []
+
+        def readonly(screen, session, command, path):
+            calls.append(command)
+            raise ns["PromptLostError"]("lost")
+        ns["capture_readonly_command"] = readonly
+        open(self.out, "wb").close()
+        ns["collect_platform_metadata"](self.screen, self.crt.session, self.out)
+        self.assertEqual(calls, ["show version"])
+
+    # ---- output location ----
+    def test_output_root_default_is_portable(self):
+        os.environ.pop("EXOS_CRAWLER_OUTPUT_ROOT", None)
+        root = self.ns["resolve_output_root"]("leaf")
+        self.assertTrue(root.startswith(os.path.expanduser("~")))
+        self.assertIn("Documents", root)
+        self.assertFalse(":" in root.replace(os.path.expanduser("~"), ""))
+
+    def test_output_root_override(self):
+        os.environ["EXOS_CRAWLER_OUTPUT_ROOT"] = self.tmp
+        self.assertEqual(self.ns["resolve_output_root"]("leaf"), os.path.join(self.tmp, "leaf"))
+
+    def test_no_hardcoded_drive_path_in_script(self):
+        with open(os.path.join(HELPERS, self.script)) as handle:
+            self.assertNotIn("C:\\", handle.read())
 
     def test_metadata_query_failure_recorded(self):
         ns = self.ns
