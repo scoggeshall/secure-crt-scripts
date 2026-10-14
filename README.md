@@ -45,9 +45,19 @@ Path:
 
 ---
 
+### EXOS CLI Crawler Suite
+Read-only help crawlers for Extreme EXOS / Switch Engine (`?` help only; discovered commands are never executed).
+
+- Suite guide: [`helpers/README-exos-crawler-suite.md`](helpers/README-exos-crawler-suite.md)
+- Show help crawler: [`helpers/exos-show-help-crawler.py`](helpers/exos-show-help-crawler.py)
+- Config help crawler: [`helpers/exos-config-help-crawler.py`](helpers/exos-config-help-crawler.py)
+- Config context crawler: [`helpers/exos-config-mode-crawler.py`](helpers/exos-config-mode-crawler.py)
+
+---
+
 ## Design Principles
 
-- No hardcoded paths
+- No hardcoded paths (the EXOS crawlers default to the user's `Documents` folder and accept the `EXOS_CRAWLER_OUTPUT_ROOT` override)
 - Scripts operate on active SecureCRT context
 - Prefer detection over user input
 - Safe execution (confirm before sending commands)
@@ -70,7 +80,8 @@ All scripts are intended to be:
 Each script is self-contained:
 
 - script file
-- README
+- documentation (a README, or for script families a shared guide such as the
+  [EXOS suite guide](helpers/README-exos-crawler-suite.md))
 - supporting data (if required)
 
 This allows scripts to be:

@@ -8,7 +8,7 @@ import os
 import re
 
 SCRIPT_TITLE = "EXOS Configuration Context Crawler"
-OUTPUT_ROOT = r"C:\scripts\secure-crt\outputs\exos-context-help"
+OUTPUT_LEAF = 'exos-context-help'
 CONTEXT_ROOTS = ["configure", "enable", "disable", "create", "delete", "unconfigure"]
 
 # EXOS has a flat CLI. This is the equivalent of the VOSS config-mode crawler:
@@ -44,6 +44,8 @@ MAX_COMMANDS_PER_ROOT = 8000
 MAX_TOTAL_COMMANDS = 30000
 MAX_COMMAND_TOKENS = 24
 MAX_PLACEHOLDER_BRANCHES_PER_QUERY = 2
+IDYES = 6
+METADATA_COMMANDS = ['show version', 'show switch']
 
 
 def normalize_placeholder(token):
@@ -112,19 +114,21 @@ def Main():
     answer = crt.Dialog.Prompt(
         "This is the EXOS equivalent of the VOSS configuration-mode crawler.\n\n"
         "EXOS uses a flat CLI, so this crawler fills resolvable placeholders and continues ? syntax help.\n\n"
-        "Example values:\n" + "\n".join(preview) + "\n\n"
+        "Example values (used only inside ? help queries, never executed):\n" + "\n".join(preview) + "\n\n"
+        "Roots: " + ", ".join(CONTEXT_ROOTS) + "\n"
         "No discovered configuration command is executed.\n\nType CONTEXTCRAWL to continue.",
         SCRIPT_TITLE, "", False)
     if answer is None or answer.strip().upper() != "CONTEXTCRAWL":
         return
 
-    ensure_directory(OUTPUT_ROOT)
+    output_root = resolve_output_root(OUTPUT_LEAF)
+    ensure_directory(output_root)
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    output_path = os.path.join(OUTPUT_ROOT, timestamp + "_" + sanitize_filename(hostname_from_prompt(prompt)) + "_context-help.txt")
+    output_path = os.path.join(output_root, timestamp + "_" + sanitize_filename(hostname_from_prompt(prompt)) + "_context-help.txt")
     previous_logging = session.Logging
     previous_log_file = session.LogFileName
-    total_commands = total_literals = total_placeholders = total_resolved = 0
-    total_unresolved = total_failures = total_token_skips = 0
+    stats = new_stats()
+    paging = new_paging_state()
 
     try:
         if session.Logging:
@@ -135,101 +139,46 @@ def Main():
             "Prompt: " + prompt + "\n",
             "Roots: " + ", ".join(CONTEXT_ROOTS) + "\n",
             "Maximum depth/root: " + str(MAX_DEPTH_PER_ROOT) + "\n",
+            "Maximum commands/root: " + str(MAX_COMMANDS_PER_ROOT) + "\n",
             "Maximum total commands: " + str(MAX_TOTAL_COMMANDS) + "\n",
-            "Maximum command tokens: " + str(MAX_COMMAND_TOKENS) + "\n\nBaseline values:\n"
+            "Maximum command tokens: " + str(MAX_COMMAND_TOKENS) + "\n",
+            "Maximum placeholder branches/query: " + str(MAX_PLACEHOLDER_BRANCHES_PER_QUERY) + "\n\n"
+            "Example values are used only in question-mark help queries; no discovered command is executed.\n\nBaseline values:\n"
         ]
         for key in sorted(BASELINE_VALUES.keys()):
             lines.append("  " + key + ": " + BASELINE_VALUES[key] + "\n")
         lines.append("\n")
         write_text(output_path, "".join(lines))
-        run_normal_command(screen, "disable cli paging")
-
-        global_visited = set()
-        for root_index in range(len(CONTEXT_ROOTS)):
-            if total_commands >= MAX_TOTAL_COMMANDS:
-                break
-            root = CONTEXT_ROOTS[root_index]
-            append_text(output_path, "\n" + "#" * 110 + "\nContext Root " + str(root_index + 1) + ": " + root + "\n" + "#" * 110 + "\n")
-            queue = collections.deque([{"command": root, "depth": 1}])
-            root_count = 0
-
-            while queue:
-                if root_count >= MAX_COMMANDS_PER_ROOT or total_commands >= MAX_TOTAL_COMMANDS:
-                    break
-                item = queue.popleft()
-                command = item["command"].strip()
-                depth = item["depth"]
-                if command.lower() in global_visited:
-                    continue
-                global_visited.add(command.lower())
-                root_count += 1
-                total_commands += 1
-                append_text(output_path, "\n" + "=" * 110 + "\nRoot: " + root + "\nQuery: " + str(root_count) + "\nTotal Query: " + str(total_commands) + "\nDepth: " + str(depth) + "\nCommand: " + command + " ?\n" + "=" * 110 + "\n")
-                try:
-                    captured = capture_help_query(screen, session, command, output_path)
-                    literals, placeholders = parse_help_entries(captured)
-                    total_literals += len(literals)
-                    total_placeholders += len(placeholders)
-                    resolved = []
-                    unresolved = []
-                    for placeholder in placeholders:
-                        value = resolve_placeholder(placeholder, command)
-                        if value:
-                            resolved.append((placeholder, value))
-                        else:
-                            unresolved.append(placeholder)
-                    total_resolved += len(resolved)
-                    total_unresolved += len(unresolved)
-                    result = ["\nParser Results\n", "Literal children: " + str(len(literals)) + "\n", "Value placeholders: " + str(len(placeholders)) + "\n"]
-                    if literals:
-                        result.append("Children: " + join_values(literals) + "\n")
-                    if placeholders:
-                        result.append("Placeholders: " + join_values(placeholders) + "\n")
-                    if resolved:
-                        result.append("Resolved examples:\n")
-                        for placeholder, value in resolved:
-                            result.append("  " + to_text(placeholder) + " -> " + value + "\n")
-                    if unresolved:
-                        result.append("Unresolved placeholders: " + join_values(unresolved) + "\n")
-                    append_text(output_path, "".join(result))
-                    if depth < MAX_DEPTH_PER_ROOT:
-                        for option in literals:
-                            child = command + " " + option
-                            if len(child.split()) > MAX_COMMAND_TOKENS:
-                                total_token_skips += 1
-                                continue
-                            if child.lower() not in global_visited:
-                                queue.append({"command": child, "depth": depth + 1})
-                        used = 0
-                        for placeholder, value in resolved:
-                            if used >= MAX_PLACEHOLDER_BRANCHES_PER_QUERY:
-                                break
-                            child = command + " " + value
-                            if len(child.split()) > MAX_COMMAND_TOKENS:
-                                total_token_skips += 1
-                                continue
-                            if child.lower() not in global_visited:
-                                queue.append({"command": child, "depth": depth + 1})
-                                used += 1
-                except Exception as exc:
-                    total_failures += 1
-                    try:
-                        if session.Logging:
-                            session.Log(False)
-                    except Exception:
-                        pass
-                    append_text(output_path, "\nERROR: " + to_text(exc) + "\n")
-                    clear_command_line(screen)
+        proceed = prepare_paging(screen, session, output_path, paging, stats)
+        append_text(output_path, "CLI paging: " + paging["note"] + "\n\n")
+        if proceed:
+            stats["metadata_failures"] = collect_platform_metadata(screen, session, output_path, stats)
+            if stats["prompt_lost"]:
+                stats["skip_reason"] = "CLI prompt lost during metadata collection"
+                append_text(output_path, "Crawl not run: " + stats["skip_reason"] + "\n")
+            else:
+                run_context_crawl(screen, session, output_path, stats)
+        else:
+            stats["skip_reason"] = "CLI paging not changed or could not be disabled (" + paging["note"] + ")"
+            append_text(output_path, "Crawl not run (see CLI paging note above).\n")
+        restore_paging(screen, session, output_path, paging, stats)
 
         append_text(output_path,
             "\n" + "#" * 110 + "\nFinal Crawl Summary\n" + "#" * 110 + "\n"
-            "Help commands queried: " + str(total_commands) + "\n"
-            "Literal options discovered: " + str(total_literals) + "\n"
-            "Placeholders discovered: " + str(total_placeholders) + "\n"
-            "Placeholder examples resolved: " + str(total_resolved) + "\n"
-            "Unresolved placeholders: " + str(total_unresolved) + "\n"
-            "Token-limit branches skipped: " + str(total_token_skips) + "\n"
-            "Failures: " + str(total_failures) + "\n")
+            "Status: " + crawl_status_text(stats) + "\n"
+            "Help commands queried: " + str(stats["queries"]) + "\n"
+            "Literal options discovered: " + str(stats["literals"]) + "\n"
+            "Placeholders discovered: " + str(stats["placeholders"]) + "\n"
+            "Placeholder examples resolved: " + str(stats["resolved"]) + "\n"
+            "Unresolved placeholders: " + str(stats["unresolved"]) + "\n"
+            "Incomplete queries (timeouts): " + str(stats["incomplete"]) + "\n"
+            "Error responses: " + str(stats["errors"]) + "\n"
+            "Duplicate commands not re-queued: " + str(stats["duplicates"]) + "\n"
+            "Token-limit branches skipped: " + str(stats["token_skips"]) + "\n"
+            "Metadata query failures: " + str(stats["metadata_failures"]) + "\n"
+            "Failures: " + str(stats["failures"]) + "\n"
+        "Paging failures: " + str(len(stats["paging_failures"])) + "\n"
+        + "".join(["  " + m + "\n" for m in stats["paging_failures"]]))
     finally:
         try:
             if session.Logging:
@@ -237,7 +186,7 @@ def Main():
         except Exception:
             pass
         try:
-            run_normal_command(screen, "enable cli paging")
+            restore_paging(screen, session, output_path, paging, stats)
         except Exception:
             pass
         try:
@@ -251,23 +200,252 @@ def Main():
                 pass
 
     crt.Dialog.MessageBox(
-        "Configuration context crawl complete.\n\nHelp commands queried: " + str(total_commands) + "\nLiteral options discovered: " + str(total_literals) + "\nPlaceholders discovered: " + str(total_placeholders) + "\nPlaceholder examples resolved: " + str(total_resolved) + "\nFailures: " + str(total_failures) + "\n\nOutput file:\n" + output_path,
+        crawl_status_text(stats) + ".\n\nHelp commands queried: " + str(stats["queries"])
+        + "\nLiteral options discovered: " + str(stats["literals"])
+        + "\nPlaceholders discovered: " + str(stats["placeholders"])
+        + "\nPlaceholder examples resolved: " + str(stats["resolved"])
+        + "\nIncomplete queries (timeouts): " + str(stats["incomplete"])
+        + "\nError responses: " + str(stats["errors"])
+        + "\nFailures: " + str(stats["failures"])
+        + paging_failure_text(stats)
+        + "\n\nOutput file:\n" + output_path,
         SCRIPT_TITLE)
 
-def capture_help_query(screen, session, command, output_path):
-    clear_command_line(screen)
-    start = get_file_size(output_path)
+
+def paging_failure_text(stats):
+    if not stats["paging_failures"]:
+        return ""
+    return "\n\nPAGING PROBLEMS (check CLI paging manually):\n" + "\n".join(stats["paging_failures"])
+
+
+def crawl_status_text(stats):
+    if stats["skip_reason"]:
+        return "Crawl SKIPPED (no help queries were sent): " + stats["skip_reason"]
+    if stats["prompt_lost"]:
+        return "Crawl STOPPED EARLY: the CLI prompt could not be confirmed"
+    return "Crawl complete"
+
+
+def new_stats():
+    return {"queries": 0, "literals": 0, "placeholders": 0, "resolved": 0,
+            "unresolved": 0, "failures": 0, "token_skips": 0, "incomplete": 0,
+            "errors": 0, "duplicates": 0, "metadata_failures": 0, "paging_failures": [], "prompt_lost": False, "skip_reason": ""}
+
+
+def run_context_crawl(screen, session, output_path, stats):
+    visited = set()
+    queued = set()
+    for root_index in range(len(CONTEXT_ROOTS)):
+        if stats["queries"] >= MAX_TOTAL_COMMANDS or stats["prompt_lost"]:
+            break
+        root = CONTEXT_ROOTS[root_index]
+        append_text(output_path, "\n" + "#" * 110 + "\nContext Root " + str(root_index + 1) + ": " + root + "\n" + "#" * 110 + "\n")
+        queue = collections.deque()
+        enqueue_command(queue, queued, root, 1)
+        root_count = 0
+        while queue:
+            if root_count >= MAX_COMMANDS_PER_ROOT or stats["queries"] >= MAX_TOTAL_COMMANDS or stats["prompt_lost"]:
+                break
+            item = queue.popleft()
+            command = item["command"].strip()
+            if command.lower() in visited:
+                stats["duplicates"] += 1
+                continue
+            visited.add(command.lower())
+            root_count += 1
+            process_context_query(screen, session, output_path, root, root_count, command, item["depth"], queue, queued, stats)
+
+
+def process_context_query(screen, session, output_path, root, root_count, command, depth, queue, queued, stats):
+    stats["queries"] += 1
+    append_text(output_path, "\n" + "=" * 110 + "\nRoot: " + root + "\nQuery: " + str(root_count) + "\nTotal Query: " + str(stats["queries"]) + "\nDepth: " + str(depth) + "\nCommand: " + command + " ?\n" + "=" * 110 + "\n")
+    try:
+        captured, complete = capture_help_query(screen, session, command, output_path)
+        if not complete:
+            stats["incomplete"] += 1
+            append_text(output_path,
+                "\nINCOMPLETE QUERY: screen did not become idle within the time limit.\n"
+                "Output was not parsed and no child commands were queued.\n")
+            return
+        if classify_help_response(captured) == "error":
+            stats["errors"] += 1
+            append_text(output_path,
+                "\nERROR RESPONSE: the device rejected this help query.\n"
+                "Output was not parsed and no child commands were queued.\n")
+            return
+        literals, placeholders = parse_help_entries(captured)
+        stats["literals"] += len(literals)
+        stats["placeholders"] += len(placeholders)
+        resolved = []
+        unresolved = []
+        for placeholder in placeholders:
+            value = resolve_placeholder(placeholder, command)
+            if value:
+                resolved.append((placeholder, value))
+            else:
+                unresolved.append(placeholder)
+        stats["resolved"] += len(resolved)
+        stats["unresolved"] += len(unresolved)
+        result = ["\nParser Results\n", "Literal children: " + str(len(literals)) + "\n", "Value placeholders: " + str(len(placeholders)) + "\n"]
+        if literals:
+            result.append("Children: " + join_values(literals) + "\n")
+        if placeholders:
+            result.append("Placeholders: " + join_values(placeholders) + "\n")
+        if resolved:
+            result.append("Resolved examples (used only in ? help queries):\n")
+            for placeholder, value in resolved:
+                result.append("  " + to_text(placeholder) + " -> " + value + "\n")
+        if unresolved:
+            result.append("Unresolved placeholders: " + join_values(unresolved) + "\n")
+        append_text(output_path, "".join(result))
+        if depth < MAX_DEPTH_PER_ROOT:
+            for option in literals:
+                child = command + " " + option
+                if len(child.split()) > MAX_COMMAND_TOKENS:
+                    stats["token_skips"] += 1
+                    continue
+                if not enqueue_command(queue, queued, child, depth + 1):
+                    stats["duplicates"] += 1
+            used = 0
+            for placeholder, value in resolved:
+                if used >= MAX_PLACEHOLDER_BRANCHES_PER_QUERY:
+                    break
+                child = command + " " + value
+                if len(child.split()) > MAX_COMMAND_TOKENS:
+                    stats["token_skips"] += 1
+                    continue
+                if enqueue_command(queue, queued, child, depth + 1):
+                    used += 1
+                else:
+                    stats["duplicates"] += 1
+    except PromptLostError as exc:
+        stats["prompt_lost"] = True
+        if exc.timed_out:
+            stats["incomplete"] += 1
+        try:
+            if session.Logging:
+                session.Log(False)
+        except Exception:
+            pass
+        append_text(output_path, "\nPROMPT LOST: " + to_text(exc) + "\nCrawl stopped; no further queries will be sent.\n")
+    except Exception as exc:
+        stats["failures"] += 1
+        try:
+            if session.Logging:
+                session.Log(False)
+        except Exception:
+            pass
+        append_text(output_path, "\nERROR: " + to_text(exc) + "\n")
+        clear_command_line(screen)
+
+
+# ---- Shared helpers (identical in all three EXOS crawlers) ----
+
+def start_capture(session, output_path):
     session.LogFileName = output_path
     session.Log(True, True, False)
-    screen.Send(command + " ?")
-    crt.Sleep(INITIAL_RENDER_DELAY_MS)
-    wait_for_screen_idle(screen)
-    screen.Send(chr(3))
-    crt.Sleep(AFTER_CANCEL_DELAY_MS)
-    wait_for_screen_idle(screen)
-    session.Log(False)
+
+
+def capture_help_query(screen, session, command, output_path):
+    """Send 'command ?' (never Enter), cancel with Ctrl+C.
+    Returns (text, complete). complete is False if the screen never went idle.
+    Raises PromptLostError if no prompt is confirmed before the query, or after
+    a timeout, so no further query is sent into an unknown CLI state."""
+    if not ensure_usable_prompt(screen):
+        raise PromptLostError("No usable CLI prompt before: " + command + " ?")
+    start = get_file_size(output_path)
+    start_capture(session, output_path)
+    complete = True
+    try:
+        screen.Send(command + " ?")
+        crt.Sleep(INITIAL_RENDER_DELAY_MS)
+        if not wait_for_screen_idle(screen):
+            complete = False
+        screen.Send(chr(3))
+        crt.Sleep(AFTER_CANCEL_DELAY_MS)
+        if not wait_for_screen_idle(screen):
+            complete = False
+    finally:
+        session.Log(False)
     crt.Sleep(BETWEEN_QUERY_DELAY_MS)
-    return normalize_capture(read_file_from_offset(output_path, start))
+    text = normalize_capture(read_file_from_offset(output_path, start))
+    if not complete and not ensure_usable_prompt(screen):
+        raise PromptLostError("CLI prompt not recovered after timeout: " + command + " ?", True)
+    return text, complete
+
+
+class PromptLostError(Exception):
+    def __init__(self, message, timed_out=False):
+        Exception.__init__(self, message)
+        self.timed_out = timed_out
+
+
+def get_current_prompt(screen):
+    """Return the prompt on the cursor row only, or "" if that row is not a
+    prompt. Earlier rows are ignored so a stale prompt above a pager or other
+    output is never mistaken for the current state."""
+    try:
+        value = screen.Get(screen.CurrentRow, 0, screen.CurrentRow, screen.Columns).strip()
+    except Exception:
+        return ""
+    if value and re.search(r"[>#]\s*$", value):
+        return value
+    return ""
+
+
+def ensure_usable_prompt(screen):
+    """Cancel any partial input and confirm the cursor row is a CLI prompt."""
+    clear_command_line(screen)
+    return get_current_prompt(screen) != ""
+
+
+def capture_readonly_command(screen, session, command, output_path):
+    """Run one read-only command. Returns (text, complete).
+    On a timeout the command is canceled with Ctrl+C and the prompt is
+    confirmed; PromptLostError is raised if the CLI is not usable again."""
+    if not ensure_usable_prompt(screen):
+        raise PromptLostError("No usable CLI prompt before: " + command)
+    start = get_file_size(output_path)
+    start_capture(session, output_path)
+    complete = True
+    try:
+        screen.Send(command + "\r")
+        crt.Sleep(NORMAL_COMMAND_DELAY_MS)
+        if not wait_for_screen_idle(screen):
+            complete = False
+            screen.Send(chr(3))
+            crt.Sleep(AFTER_CANCEL_DELAY_MS)
+            wait_for_screen_idle(screen)
+    finally:
+        session.Log(False)
+    crt.Sleep(BETWEEN_QUERY_DELAY_MS)
+    text = normalize_capture(read_file_from_offset(output_path, start))
+    if not complete and not ensure_usable_prompt(screen):
+        raise PromptLostError("CLI prompt not recovered after timeout: " + command, True)
+    return text, complete
+
+
+def resolve_output_root(leaf):
+    """Output directory: $EXOS_CRAWLER_OUTPUT_ROOT/<leaf> if set, otherwise
+    <home>/Documents/SecureCRT-Outputs/<leaf>."""
+    override = os.environ.get("EXOS_CRAWLER_OUTPUT_ROOT", "").strip()
+    if override:
+        base = override
+    else:
+        base = os.path.join(os.path.expanduser("~"), "Documents", "SecureCRT-Outputs")
+    return os.path.join(base, leaf)
+
+
+def classify_help_response(text):
+    """Return 'error' for EXOS rejection text, otherwise 'ok'."""
+    for original in normalize_capture(text).split(u"\n"):
+        stripped = remove_log_prefix(original).strip()
+        if stripped.startswith(u"%%") or stripped.startswith(u"%"):
+            return "error"
+        if re.search(u"(?i)(invalid input|ambiguous command|incomplete command|unknown command)", stripped):
+            if not stripped.endswith(u"?"):
+                return "error"
+    return "ok"
 
 
 def parse_help_entries(text):
@@ -280,11 +458,15 @@ def parse_help_entries(text):
             continue
         if stripped.startswith(u"^") or stripped.startswith(u"%"):
             continue
+        if re.match(u"^\\*?\\s*\\S+\\s[#>]\\s", stripped):
+            continue
 
         match = re.match(u"^\\s*([^\\s]+)\\s{2,}\\S.*$", line)
         if not match:
             continue
         token = match.group(1).strip().strip(u",")
+        if is_end_marker(token):
+            continue
         if is_literal(token):
             if token not in literals:
                 literals.append(token)
@@ -294,8 +476,12 @@ def parse_help_entries(text):
     return literals, placeholders
 
 
+def is_end_marker(token):
+    return token.lower() == u"<cr>"
+
+
 def is_literal(token):
-    return re.match(u"^[a-z][a-z0-9_.:/-]*$", token) is not None
+    return re.match(u"^[a-z][a-z0-9_.:/-]*$", token) is not None and u"_" not in token
 
 
 def is_placeholder(token):
@@ -303,9 +489,154 @@ def is_placeholder(token):
         return True
     if u"_" in token:
         return True
-    if token.upper() == token and re.search(u"[A-Z]", token):
+    if re.search(u"[A-Z]", token):
         return True
     return False
+
+
+def enqueue_command(queue, queued, command, depth):
+    """Queue a command once. Returns False if it was already queued."""
+    key = command.strip().lower()
+    if key in queued:
+        return False
+    queued.add(key)
+    queue.append({"command": command.strip(), "depth": depth})
+    return True
+
+
+def parse_paging_state(text):
+    """Return True (enabled), False (disabled) or None (not found)."""
+    for original in normalize_capture(text).split(u"\n"):
+        line = remove_log_prefix(original)
+        match = re.match(u"(?i)^\\s*CLI\\s+paging\\s*:\\s*(enabled|disabled)", line)
+        if match:
+            return match.group(1).lower() == u"enabled"
+    return None
+
+
+def new_paging_state():
+    return {"restore_command": None, "restored": False, "note": ""}
+
+
+def set_paging(screen, session, output_path, command):
+    """Run a paging command. Returns (ok, detail); never raises for CLI problems."""
+    try:
+        text, complete = capture_readonly_command(screen, session, command, output_path)
+    except Exception as exc:
+        return False, to_text(exc)
+    if not complete:
+        return False, "timed out"
+    if classify_help_response(text) == "error":
+        return False, "device returned an error"
+    return True, "ok"
+
+
+def prepare_paging(screen, session, output_path, paging, stats):
+    """Detect the CLI paging state and disable paging if needed.
+    Returns True if the crawl may proceed. paging["restore_command"] is set
+    BEFORE the disable attempt so cleanup always knows paging may have changed."""
+    try:
+        text, complete = capture_readonly_command(screen, session, "show management", output_path)
+        state = parse_paging_state(text) if complete else None
+    except Exception as exc:
+        state = None
+        stats["paging_failures"].append("Paging state query failed: " + to_text(exc))
+    if state is False:
+        paging["note"] = "already disabled; left unchanged"
+        return True
+    if state is True:
+        paging["note"] = "was enabled; disabled for the crawl and will be re-enabled"
+    else:
+        answer = crt.Dialog.MessageBox(
+            "The script could not read the current CLI paging state from 'show management'.\n\n"
+            "To continue it must run 'disable cli paging'. Afterward it will run "
+            "'enable cli paging' (the EXOS default), even if paging was previously disabled.\n\n"
+            "Continue?",
+            SCRIPT_TITLE, 32 | 4)
+        if answer != IDYES:
+            paging["note"] = "state unknown; user declined; paging not changed"
+            return False
+        paging["note"] = "state could not be detected; user confirmed; will be set to enabled afterward"
+    paging["restore_command"] = "enable cli paging"
+    ok, detail = set_paging(screen, session, output_path, "disable cli paging")
+    if not ok:
+        stats["paging_failures"].append("Disable paging failed: " + detail)
+        paging["note"] += "; DISABLE FAILED (" + detail + "); crawl skipped"
+        return False
+    return True
+
+
+def restore_paging(screen, session, output_path, paging, stats):
+    """Restore paging once. Failures are counted and written to the output file."""
+    if paging["restored"] or not paging["restore_command"]:
+        return True
+    paging["restored"] = True
+    ok, detail = set_paging(screen, session, output_path, paging["restore_command"])
+    if ok:
+        append_text(output_path, "\nCLI paging restore: '" + paging["restore_command"] + "' succeeded.\n")
+        return True
+    message = "Restore paging failed ('" + paging["restore_command"] + "'): " + detail
+    stats["paging_failures"].append(message)
+    try:
+        append_text(output_path, "\nCLI paging restore: FAILED. " + message + "\nCheck and restore the CLI paging setting manually.\n")
+    except Exception:
+        pass
+    return False
+
+
+def parse_platform_metadata(version_text, switch_text):
+    """Return a list of (label, value) from show version / show switch output."""
+    items = []
+    combined = normalize_capture(version_text) + u"\n" + normalize_capture(switch_text)
+    match = re.search(u"(?i)(ExtremeXOS|Switch Engine)\\s+version\\s+(\\S+)", combined)
+    if match:
+        items.append(("EXOS version", match.group(1) + u" " + match.group(2)))
+    for label, pattern in (("System type", u"(?im)^\\s*System Type\\s*:\\s*(.+?)\\s*$"),
+                           ("Boot ROM", u"(?im)^\\s*BootROM\\s*:\\s*(.+?)\\s*$"),
+                           ("Hardware (show version)", u"(?im)^\\s*(?:Switch|Chassis)\\s*:\\s*(.+?)\\s*$")):
+        match = re.search(pattern, combined)
+        if match:
+            items.append((label, match.group(1)))
+    return items
+
+
+def collect_platform_metadata(screen, session, output_path, stats=None):
+    """Append read-only platform metadata to the output. Returns failure count."""
+    failures = 0
+    texts = []
+    lines = ["Platform metadata (read-only: " + ", ".join(METADATA_COMMANDS) + ")\n"]
+    for command in METADATA_COMMANDS:
+        try:
+            text, complete = capture_readonly_command(screen, session, command, output_path)
+            if not complete:
+                failures += 1
+                lines.append("  Metadata query incomplete (timeout): " + command + "\n")
+                text = u""
+            texts.append(text)
+        except Exception as exc:
+            failures += 1
+            lines.append("  Metadata query failed: " + command + ": " + to_text(exc) + "\n")
+            texts.append(u"")
+            try:
+                if session.Logging:
+                    session.Log(False)
+            except Exception:
+                pass
+            if isinstance(exc, PromptLostError):
+                if stats is not None:
+                    stats["prompt_lost"] = True
+                lines.append("  Remaining metadata queries skipped: CLI prompt not usable.\n")
+                break
+    while len(texts) < 2:
+        texts.append(u"")
+    items = parse_platform_metadata(texts[0], texts[1])
+    if not items:
+        failures += 1
+        lines.append("  No EXOS version or platform information could be parsed.\n")
+    for label, value in items:
+        lines.append("  " + label + ": " + to_text(value) + "\n")
+    append_text(output_path, "\nMetadata raw capture ends above.\n" + "".join(lines) + "\n")
+    return failures
 
 
 def clear_command_line(screen):
