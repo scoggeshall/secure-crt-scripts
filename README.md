@@ -45,6 +45,16 @@ Path:
 
 ---
 
+### EXOS CLI Crawler Suite
+Read-only help crawlers for Extreme EXOS / Switch Engine (`?` help only; discovered commands are never executed).
+
+- Suite guide: [`helpers/README-exos-crawler-suite.md`](helpers/README-exos-crawler-suite.md)
+- Show help crawler: [`helpers/exos-show-help-crawler.py`](helpers/exos-show-help-crawler.py)
+- Config help crawler: [`helpers/exos-config-help-crawler.py`](helpers/exos-config-help-crawler.py)
+- Config context crawler: [`helpers/exos-config-mode-crawler.py`](helpers/exos-config-mode-crawler.py)
+
+---
+
 ## Design Principles
 
 - No hardcoded paths
