@@ -392,6 +392,105 @@ class AllScripts(object):
         ns["collect_platform_metadata"](self.screen, self.crt.session, self.out)
         self.assertEqual(calls, ["show version"])
 
+    # ---- prompt loss propagation ----
+    def stale_prompt_screen(self):
+        """Prompt visible on an earlier row, pager text on the cursor row."""
+        self.screen.CurrentRow = 5
+
+        def get(r1, c1, r2, c2):
+            return "X460G2.1 # " if r1 < 5 else " --More--"
+        self.screen.Get = get
+
+    def test_get_prompt_is_fooled_but_current_prompt_is_not(self):
+        self.stale_prompt_screen()
+        self.assertNotEqual(self.ns["get_prompt"](self.screen), "")
+        self.assertEqual(self.ns["get_current_prompt"](self.screen), "")
+        self.assertFalse(self.ns["ensure_usable_prompt"](self.screen))
+
+    def test_stale_prompt_above_pager_is_not_recovery(self):
+        self.stale_prompt_screen()
+        self.screen.idle = False
+        self.ns["MAX_IDLE_CHECKS"] = 1
+        open(self.out, "wb").close()
+        with self.assertRaises(self.ns["PromptLostError"]):
+            self.ns["capture_readonly_command"](self.screen, self.crt.session, "show version", self.out)
+
+    def test_help_query_refuses_to_send_without_prompt(self):
+        self.stale_prompt_screen()
+        open(self.out, "wb").close()
+        before = len(self.screen.sent)
+        with self.assertRaises(self.ns["PromptLostError"]):
+            self.ns["capture_help_query"](self.screen, self.crt.session, "show vlan", self.out)
+        self.assertNotIn("show vlan ?", self.screen.sent[before:])
+
+    def test_help_query_timeout_without_prompt_recovery_raises(self):
+        self.screen.idle = False
+        self.ns["MAX_IDLE_CHECKS"] = 1
+        open(self.out, "wb").close()
+        original = self.screen.Get
+        calls = {"n": 0}
+
+        def get(*a):
+            calls["n"] += 1
+            return original(*a) if calls["n"] <= 1 else " --More--"
+        self.screen.Get = get
+        with self.assertRaises(self.ns["PromptLostError"]) as ctx:
+            self.ns["capture_help_query"](self.screen, self.crt.session, "show vlan", self.out)
+        self.assertTrue(ctx.exception.timed_out)
+
+    def test_prompt_lost_in_crawl_stops_queries(self):
+        ns = self.ns
+        calls = []
+
+        def capture(*a):
+            calls.append(a[2])
+            if len(calls) == 2:
+                raise ns["PromptLostError"]("lost", True)
+            return HELP_FIXTURE, True
+        ns["capture_help_query"] = capture
+        queue, queued, stats = collections.deque(), set(), ns["new_stats"]()
+        self._process(queue, queued, stats)
+        self._process(queue, queued, stats)
+        self.assertTrue(stats["prompt_lost"])
+        self.assertEqual(stats["incomplete"], 1)
+        self.assertIn("PROMPT LOST", self.read())
+        crawl = ns["run_crawl"] if "run_crawl" in ns else ns["run_context_crawl"]
+        calls_before = len(calls)
+        crawl(self.screen, self.crt.session, self.out, stats)
+        self.assertEqual(len(calls), calls_before)
+
+    def test_metadata_prompt_loss_skips_crawl(self):
+        self.run_main(SHOW_MGMT_ENABLED, responses={"show version": self.ns["PromptLostError"]("lost")})
+        self.assertNotIn("CRAWL", self.order)
+        self.assertEqual(self.order[-1], "enable cli paging")
+        text = self.output_text()
+        self.assertIn("Crawl not run: CLI prompt lost during metadata collection", text)
+        self.assertIn("Status: Crawl SKIPPED", text)
+        self.assertIn("Crawl SKIPPED", self.final_dialog())
+        self.assertNotIn("Crawl complete", self.final_dialog())
+
+    # ---- final status ----
+    def test_status_completed(self):
+        self.run_main(SHOW_MGMT_ENABLED)
+        self.assertIn("Crawl complete", self.final_dialog())
+        self.assertIn("Status: Crawl complete", self.output_text())
+
+    def test_status_skipped_when_disable_fails(self):
+        self.run_main(SHOW_MGMT_ENABLED, responses={"disable cli paging": "timeout"})
+        self.assertIn("Crawl SKIPPED", self.final_dialog())
+        self.assertNotIn("Crawl complete", self.final_dialog())
+
+    def test_status_skipped_when_user_declines(self):
+        self.run_main(u"garbage", answer_yes=False)
+        self.assertIn("Crawl SKIPPED", self.final_dialog())
+        self.assertNotIn("Crawl complete", self.final_dialog())
+        self.assertIn("Status: Crawl SKIPPED", self.output_text())
+
+    def test_status_stopped_early_text(self):
+        stats = self.ns["new_stats"]()
+        stats["prompt_lost"] = True
+        self.assertIn("STOPPED EARLY", self.ns["crawl_status_text"](stats))
+
     # ---- output location ----
     def test_output_root_default_is_portable(self):
         os.environ.pop("EXOS_CRAWLER_OUTPUT_ROOT", None)

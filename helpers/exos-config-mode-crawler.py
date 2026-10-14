@@ -152,14 +152,20 @@ def Main():
         proceed = prepare_paging(screen, session, output_path, paging, stats)
         append_text(output_path, "CLI paging: " + paging["note"] + "\n\n")
         if proceed:
-            stats["metadata_failures"] = collect_platform_metadata(screen, session, output_path)
-            run_context_crawl(screen, session, output_path, stats)
+            stats["metadata_failures"] = collect_platform_metadata(screen, session, output_path, stats)
+            if stats["prompt_lost"]:
+                stats["skip_reason"] = "CLI prompt lost during metadata collection"
+                append_text(output_path, "Crawl not run: " + stats["skip_reason"] + "\n")
+            else:
+                run_context_crawl(screen, session, output_path, stats)
         else:
+            stats["skip_reason"] = "CLI paging not changed or could not be disabled (" + paging["note"] + ")"
             append_text(output_path, "Crawl not run (see CLI paging note above).\n")
         restore_paging(screen, session, output_path, paging, stats)
 
         append_text(output_path,
             "\n" + "#" * 110 + "\nFinal Crawl Summary\n" + "#" * 110 + "\n"
+            "Status: " + crawl_status_text(stats) + "\n"
             "Help commands queried: " + str(stats["queries"]) + "\n"
             "Literal options discovered: " + str(stats["literals"]) + "\n"
             "Placeholders discovered: " + str(stats["placeholders"]) + "\n"
@@ -194,7 +200,7 @@ def Main():
                 pass
 
     crt.Dialog.MessageBox(
-        "Configuration context crawl complete.\n\nHelp commands queried: " + str(stats["queries"])
+        crawl_status_text(stats) + ".\n\nHelp commands queried: " + str(stats["queries"])
         + "\nLiteral options discovered: " + str(stats["literals"])
         + "\nPlaceholders discovered: " + str(stats["placeholders"])
         + "\nPlaceholder examples resolved: " + str(stats["resolved"])
@@ -212,17 +218,25 @@ def paging_failure_text(stats):
     return "\n\nPAGING PROBLEMS (check CLI paging manually):\n" + "\n".join(stats["paging_failures"])
 
 
+def crawl_status_text(stats):
+    if stats["skip_reason"]:
+        return "Crawl SKIPPED (no help queries were sent): " + stats["skip_reason"]
+    if stats["prompt_lost"]:
+        return "Crawl STOPPED EARLY: the CLI prompt could not be confirmed"
+    return "Crawl complete"
+
+
 def new_stats():
     return {"queries": 0, "literals": 0, "placeholders": 0, "resolved": 0,
             "unresolved": 0, "failures": 0, "token_skips": 0, "incomplete": 0,
-            "errors": 0, "duplicates": 0, "metadata_failures": 0, "paging_failures": []}
+            "errors": 0, "duplicates": 0, "metadata_failures": 0, "paging_failures": [], "prompt_lost": False, "skip_reason": ""}
 
 
 def run_context_crawl(screen, session, output_path, stats):
     visited = set()
     queued = set()
     for root_index in range(len(CONTEXT_ROOTS)):
-        if stats["queries"] >= MAX_TOTAL_COMMANDS:
+        if stats["queries"] >= MAX_TOTAL_COMMANDS or stats["prompt_lost"]:
             break
         root = CONTEXT_ROOTS[root_index]
         append_text(output_path, "\n" + "#" * 110 + "\nContext Root " + str(root_index + 1) + ": " + root + "\n" + "#" * 110 + "\n")
@@ -230,7 +244,7 @@ def run_context_crawl(screen, session, output_path, stats):
         enqueue_command(queue, queued, root, 1)
         root_count = 0
         while queue:
-            if root_count >= MAX_COMMANDS_PER_ROOT or stats["queries"] >= MAX_TOTAL_COMMANDS:
+            if root_count >= MAX_COMMANDS_PER_ROOT or stats["queries"] >= MAX_TOTAL_COMMANDS or stats["prompt_lost"]:
                 break
             item = queue.popleft()
             command = item["command"].strip()
@@ -304,6 +318,16 @@ def process_context_query(screen, session, output_path, root, root_count, comman
                     used += 1
                 else:
                     stats["duplicates"] += 1
+    except PromptLostError as exc:
+        stats["prompt_lost"] = True
+        if exc.timed_out:
+            stats["incomplete"] += 1
+        try:
+            if session.Logging:
+                session.Log(False)
+        except Exception:
+            pass
+        append_text(output_path, "\nPROMPT LOST: " + to_text(exc) + "\nCrawl stopped; no further queries will be sent.\n")
     except Exception as exc:
         stats["failures"] += 1
         try:
@@ -324,8 +348,11 @@ def start_capture(session, output_path):
 
 def capture_help_query(screen, session, command, output_path):
     """Send 'command ?' (never Enter), cancel with Ctrl+C.
-    Returns (text, complete). complete is False if the screen never went idle."""
-    clear_command_line(screen)
+    Returns (text, complete). complete is False if the screen never went idle.
+    Raises PromptLostError if no prompt is confirmed before the query, or after
+    a timeout, so no further query is sent into an unknown CLI state."""
+    if not ensure_usable_prompt(screen):
+        raise PromptLostError("No usable CLI prompt before: " + command + " ?")
     start = get_file_size(output_path)
     start_capture(session, output_path)
     complete = True
@@ -341,17 +368,35 @@ def capture_help_query(screen, session, command, output_path):
     finally:
         session.Log(False)
     crt.Sleep(BETWEEN_QUERY_DELAY_MS)
-    return normalize_capture(read_file_from_offset(output_path, start)), complete
+    text = normalize_capture(read_file_from_offset(output_path, start))
+    if not complete and not ensure_usable_prompt(screen):
+        raise PromptLostError("CLI prompt not recovered after timeout: " + command + " ?", True)
+    return text, complete
 
 
 class PromptLostError(Exception):
-    pass
+    def __init__(self, message, timed_out=False):
+        Exception.__init__(self, message)
+        self.timed_out = timed_out
+
+
+def get_current_prompt(screen):
+    """Return the prompt on the cursor row only, or "" if that row is not a
+    prompt. Earlier rows are ignored so a stale prompt above a pager or other
+    output is never mistaken for the current state."""
+    try:
+        value = screen.Get(screen.CurrentRow, 0, screen.CurrentRow, screen.Columns).strip()
+    except Exception:
+        return ""
+    if value and re.search(r"[>#]\s*$", value):
+        return value
+    return ""
 
 
 def ensure_usable_prompt(screen):
-    """Cancel any partial input and confirm a CLI prompt is visible and idle."""
+    """Cancel any partial input and confirm the cursor row is a CLI prompt."""
     clear_command_line(screen)
-    return get_prompt(screen) != ""
+    return get_current_prompt(screen) != ""
 
 
 def capture_readonly_command(screen, session, command, output_path):
@@ -376,7 +421,7 @@ def capture_readonly_command(screen, session, command, output_path):
     crt.Sleep(BETWEEN_QUERY_DELAY_MS)
     text = normalize_capture(read_file_from_offset(output_path, start))
     if not complete and not ensure_usable_prompt(screen):
-        raise PromptLostError("CLI prompt not recovered after timeout: " + command)
+        raise PromptLostError("CLI prompt not recovered after timeout: " + command, True)
     return text, complete
 
 
@@ -555,7 +600,7 @@ def parse_platform_metadata(version_text, switch_text):
     return items
 
 
-def collect_platform_metadata(screen, session, output_path):
+def collect_platform_metadata(screen, session, output_path, stats=None):
     """Append read-only platform metadata to the output. Returns failure count."""
     failures = 0
     texts = []
@@ -578,6 +623,8 @@ def collect_platform_metadata(screen, session, output_path):
             except Exception:
                 pass
             if isinstance(exc, PromptLostError):
+                if stats is not None:
+                    stats["prompt_lost"] = True
                 lines.append("  Remaining metadata queries skipped: CLI prompt not usable.\n")
                 break
     while len(texts) < 2:
